@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from custom_gate import Balancingfreelossgate
+from custom_gate import BalancingLossFreeGate
 from data_utils import get_lm_corpus
 from mem_transformer import MemTransformerLM
 from utils.data_parallel import BalancedDataParallel
@@ -20,7 +20,7 @@ from utils.exp_utils import create_exp_dir
 warnings.filterwarnings(action="ignore")
 
 parser = argparse.ArgumentParser(
-    description="PyTorch SMoE Transformer Language Model with Balancingfreelossgate"
+    description="PyTorch SMoE Transformer Language Model with BalancingLossFreeGate"
 )
 parser.add_argument(
     "--data",
@@ -276,7 +276,7 @@ parser.add_argument("--moe_index", type=str, default=None, help="MoE Index")
 args = parser.parse_args()
 args.moe = True
 args.attn_moe = False
-args.gate_name = "Balancingfreelossgate"
+args.gate_name = "BalancingLossFreeGate"
 args.tied = not args.not_tied
 assert args.moe_num_expert >= args.moe_top_k, "must have moe-num-expert >= moe-top_k"
 
