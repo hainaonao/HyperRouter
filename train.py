@@ -566,6 +566,10 @@ def train():
         if args.sample_softmax > 0:
             optimizer_sparse.step()
 
+        # Finalize EMA step for BalancingLossFreeGate (no-op if not used)
+        if hasattr(model, 'balancing_state') and model.balancing_state is not None:
+            model.balancing_state.finalize_step()
+
         # step-wise learning rate annealing
         train_step += 1
         if args.scheduler in ['cosine', 'constant', 'dev_perf']:

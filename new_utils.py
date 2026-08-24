@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import torch.nn as nn 
 from fmoe.gates.base_gate import BaseGate
-from custom_gate import CustomNaiveGate_Attn
+from custom_gate import CustomNaiveGate_Attn, BalancingLossFreeGate
 
 import pdb
 import torch.nn.functional as F
@@ -11,7 +11,8 @@ import torch.nn.functional as F
 
 __all__ = ['set_top_k', 'set_router_mode', 'freeze_part_weight', 'adjust_moe_gate_number',
             'show_dts_gate_number', 'set_temperature', 'set_threshold', 
-            'SWA_Average', 'collect_top_k', 'THOR_Model']
+            'SWA_Average', 'collect_top_k', 'THOR_Model',
+            'get_routing_decisions_all_layers', 'compute_layer_fluctuations']
 
 
 def set_top_k(model, num=2):
@@ -180,6 +181,71 @@ class SWA_Average(nn.Module):
             for p_swa, p_model in zip(self.average_model.parameters(), current_model.parameters()):
                 p_swa.detach().copy_(self.avg_fn(p_swa.detach(), p_model.detach(), self.n_average))
             self.n_average +=1 
+
+def get_routing_decisions_all_layers(model, data, target, *mems):
+    """Run a forward pass and collect routing decisions (top-k expert indices)
+    from all MoE gate layers.
+
+    Args:
+        model: The MemTransformerLM model (or wrapped model).
+        data: Input data tensor.
+        target: Target tensor.
+        *mems: Memory tensors.
+
+    Returns:
+        dict[int, Tensor]: Mapping from layer index to gate_top_k_idx tensor.
+            Each tensor has shape (num_tokens, top_k).
+    """
+    # Unwrap if needed (e.g., DataParallel, THOR_Model)
+    base_model = model
+    while hasattr(base_model, 'module'):
+        base_model = base_model.module
+
+    # Forward pass (no grad needed for metric computation)
+    with torch.no_grad():
+        base_model.eval()
+        _ = base_model(data, target, *mems)
+        base_model.train()
+
+    # Collect cached routing decisions from each gate
+    routing_decisions = {}
+    layer_idx = 0
+    for layer in base_model.layers:
+        if hasattr(layer, 'pos_ff') and hasattr(layer.pos_ff, 'gate'):
+            gate = layer.pos_ff.gate
+            if hasattr(gate, 'last_top_k_idx'):
+                routing_decisions[layer_idx] = gate.last_top_k_idx
+        layer_idx += 1
+
+    return routing_decisions
+
+
+def compute_layer_fluctuations(curr_indices, prev_indices):
+    """Compute routing fluctuation per layer between two consecutive steps.
+
+    Fluctuation = fraction of tokens that changed their expert assignment.
+
+    Args:
+        curr_indices: dict[int, Tensor] from get_routing_decisions_all_layers.
+        prev_indices: dict[int, Tensor] from previous step.
+
+    Returns:
+        dict[str, float]: Mapping from 'fluc_layer_{i}' to fluctuation value (0-1).
+            Only includes layers present in both dicts.
+    """
+    fluctuations = {}
+    for layer_idx in sorted(curr_indices.keys()):
+        if layer_idx not in prev_indices:
+            continue
+        curr = curr_indices[layer_idx]
+        prev = prev_indices[layer_idx]
+        # Handle shape mismatch (e.g., different batch sizes)
+        if curr.shape != prev.shape:
+            continue
+        fluc = (curr != prev).float().mean().item()
+        fluctuations[f"fluc_layer_{layer_idx}"] = fluc
+    return fluctuations
+
 
 class THOR_Model(nn.Module):
     def __init__(self, basic_model, kl_alpha):

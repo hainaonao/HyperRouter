@@ -282,6 +282,7 @@ class RelMultiHeadAttn(nn.Module):
 from custom_transformer2 import FMoETransformerMLP as moe_qkv
 from custom_transformer import FMoETransformerMLP
 from custom_gate import *
+from balancing_loss_free_state import BalancingLossFreeState
 from fmoe.gates import NaiveGate
 
 class RelMultiHeadAttn_MoE(nn.Module):
@@ -899,6 +900,38 @@ class MemTransformerLM(nn.Module):
         self.clamp_len = clamp_len
 
         self._create_params()
+        self._setup_balancing_loss_free_state()
+
+    def _setup_balancing_loss_free_state(self):
+        """Post-init: if any gate is BalancingLossFreeGate, create a shared
+        BalancingLossFreeState and patch all gate instances with it.
+        """
+        gates = []
+        for layer in self.layers:
+            if hasattr(layer, 'pos_ff') and hasattr(layer.pos_ff, 'gate'):
+                gate = layer.pos_ff.gate
+                if isinstance(gate, BalancingLossFreeGate):
+                    gates.append(gate)
+
+        if not gates:
+            self.balancing_state = None
+            return
+
+        # Create one shared state for all layers
+        tot_expert = gates[0].tot_expert
+        shared_state = BalancingLossFreeState(
+            num_experts=tot_expert, decay=0.999
+        )
+
+        # Patch each gate with shared state and correct layer_idx
+        for layer_idx, gate in enumerate(gates):
+            gate.shared_state = shared_state
+            gate.layer_idx = layer_idx
+            shared_state.register_layer(layer_idx)
+
+        self.balancing_state = shared_state
+        print(f'[BalancingLossFreeGate] Shared state created for '
+              f'{len(gates)} layers, {tot_expert} experts')
 
     def backward_compatible(self):
         self.sample_softmax = -1

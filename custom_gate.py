@@ -2,6 +2,7 @@ r"""
 Custom Gate
 """
 from fmoe.gates.base_gate import BaseGate
+from balancing_loss_free_state import BalancingLossFreeState
 
 import torch
 import torch.nn as nn
@@ -12,7 +13,8 @@ import numpy as np
 
 __all__ = ['HyperRouterGate','CustomNaiveGate', 'CustomDropGate', 'CustomRandomGate', 'CustomRandomGate_Dense',
             'CustomDTSGate', 'CustomDTSRandomGate', 'CustomDTSGate_softmax', 'CustomDTSRandomGate_softmax',
-            'CustomDenseGate', 'CustomHashGate', 'CustomNaiveGate_Balance', 'CustomNaiveGate_Attn']
+            'CustomDenseGate', 'CustomHashGate', 'CustomNaiveGate_Balance', 'CustomNaiveGate_Attn',
+            'BalancingLossFreeGate']
 
 
 class HyperRouterGate(BaseGate):
@@ -627,9 +629,144 @@ class CustomDenseGate(BaseGate):
         return gate_top_k_idx, gate_score
 
 
+class BalancingLossFreeGate(BaseGate):
+    r"""
+    Balancing-Loss-Free Gate.
 
+    Replaces auxiliary balancing loss with memory-based expert balancing using
+    two EMA signals:
+      - RC_i: per-layer memory (EMA of router logits at layer i across steps)
+      - RL:   cross-layer memory (EMA of mean router logits across all layers,
+              finalized from the previous optimizer step)
 
+    Final router logit is a convex combination:
+      R = w_orig * R_original + w_rc * RC_i + w_rl * RL
 
+    where [w_orig, w_rc, w_rl] are computed by a Highway-style MLP + softmax
+    (ensuring non-negative weights that sum to 1 per expert dimension).
 
+    R_original is trainable (has gradient). RC_i and RL are detached memory
+    (no gradient flows through them).
 
+    Cold-start handling:
+      - Adam-style bias correction: RC_corrected = RC / (1 - d^t)
+      - RL fallback: zero vector until at least one step has been finalized
 
+    Step definition:
+      - 1 step = 1 optimizer.step(), NOT 1 forward()
+      - Supports gradient accumulation (multiple micro-batches per step)
+      - Safe with gradient checkpointing (deterministic linear cancels
+        double-count via mean)
+
+    Args:
+        d_model: Input feature dimension.
+        num_expert: Number of experts per worker.
+        world_size: Number of workers.
+        top_k: Number of experts each token is routed to.
+        shared_state: BalancingLossFreeState instance shared across all layers.
+        layer_idx: Index of this layer (0-based).
+        highway_hidden: Hidden dimension for the Highway MLP. Default: min(d_model//4, 64).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_expert: int,
+        world_size: int,
+        top_k: int = 2,
+        shared_state: BalancingLossFreeState = None,
+        layer_idx: int = 0,
+        highway_hidden: int = None,
+    ):
+        super().__init__(num_expert, world_size)
+        self.gate = nn.Linear(d_model, self.tot_expert)
+        self.top_k = top_k
+        self.dense_moe_flag = False
+        self.d_model = d_model
+        self.layer_idx = layer_idx
+
+        # --- Shared state ---
+        if shared_state is None:
+            # Fallback: create a private state (not recommended for multi-layer)
+            shared_state = BalancingLossFreeState(
+                num_experts=self.tot_expert, decay=0.999
+            )
+        self.shared_state = shared_state
+        self.shared_state.register_layer(layer_idx)
+
+        # --- Highway-style MLP ---
+        # Outputs 3*E values, reshaped to (3, E), softmax along dim=0
+        # → [w_orig, w_rc, w_rl] per expert, guaranteed to sum to 1
+        if highway_hidden is None:
+            highway_hidden = min(d_model // 4, 64)
+        self.highway_mlp = nn.Sequential(
+            nn.Linear(d_model, highway_hidden),
+            nn.ReLU(),
+            nn.Linear(highway_hidden, 3 * self.tot_expert),
+        )
+
+    def forward(self, inp, return_all_scores=False):
+        """
+        Args:
+            inp: Input tensor of shape (num_tokens, d_model).
+            return_all_scores: If True, also return raw gate logits.
+
+        Returns:
+            gate_top_k_idx: (num_tokens, top_k) indices of selected experts.
+            gate_score: (num_tokens, top_k) softmax scores for selected experts.
+            gate (optional): (num_tokens, E) raw blended gate logits.
+        """
+        # 1. Trainable router logit (has gradient)
+        r_original = self.gate(inp)  # (num_tokens, E)
+
+        if self.training:
+            # 2. Pool tokens to get a single representation for Highway weights
+            x_pooled = inp.mean(dim=0)  # (d_model,)
+
+            # 3. Highway MLP → convex combination weights
+            weights_raw = self.highway_mlp(x_pooled)  # (3*E,)
+            weights = F.softmax(
+                weights_raw.view(3, self.tot_expert), dim=0
+            )  # (3, E), each column sums to 1
+            w_orig = weights[0]  # (E,)
+            w_rc = weights[1]    # (E,)
+            w_rl = weights[2]    # (E,)
+
+            # 4. Get memory signals (detached, no gradient)
+            device = inp.device
+            rc_i = self.shared_state.get_rc(self.layer_idx, device)  # (E,)
+            rl = self.shared_state.get_rl_finalized(device)          # (E,)
+
+            # 5. Blend: R = w_orig * R_original + w_rc * RC_i + w_rl * RL
+            # w_orig broadcasts over (num_tokens, E), RC and RL broadcast from (E,)
+            gate = w_orig * r_original + w_rc * rc_i + w_rl * rl  # (num_tokens, E)
+
+            # 6. Accumulate for shared state (detached logit mean)
+            self.shared_state.accumulate(
+                self.layer_idx, r_original.detach().mean(dim=0)
+            )
+        else:
+            # Inference: use only the trainable router (no balancing needed)
+            gate = r_original
+
+        # --- Top-k selection ---
+        if self.dense_moe_flag:
+            gate = torch.ones_like(gate)
+            gate_top_k_val, gate_top_k_idx = torch.topk(
+                gate, k=self.tot_expert, dim=-1, largest=True, sorted=False
+            )
+            gate_top_k_val = gate_top_k_val.view(-1, self.tot_expert)
+        else:
+            gate_top_k_val, gate_top_k_idx = torch.topk(
+                gate, k=self.top_k, dim=-1, largest=True, sorted=False
+            )  # [.. x top_k]
+            gate_top_k_val = gate_top_k_val.view(-1, self.top_k)
+
+        gate_score = F.softmax(gate_top_k_val, dim=-1)
+
+        # Cache for external metric computation (e.g., fluctuation)
+        self.last_top_k_idx = gate_top_k_idx.detach()
+
+        if return_all_scores:
+            return gate_top_k_idx, gate_score, gate
+        return gate_top_k_idx, gate_score
