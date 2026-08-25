@@ -1,5 +1,4 @@
 # coding: utf-8
-<<<<<<< HEAD
 """
 Training script for BalancingLossFreeGate on WikiText-103.
 Configured for Medium Transformer-XL on a single T4 GPU (16 GB).
@@ -18,24 +17,14 @@ import sys
 import itertools
 import numpy as np
 
-=======
-import argparse
-import itertools
-import math
-import os
-import sys
-import time
-import warnings
-import numpy as np
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-<<<<<<< HEAD
 from data_utils import get_lm_corpus
 from mem_transformer import MemTransformerLM
 from utils.exp_utils import create_exp_dir
+from utils.data_parallel import BalancedDataParallel
 from custom_gate import BalancingLossFreeGate
 from new_utils import (
     set_top_k, set_router_mode, freeze_part_weight,
@@ -56,8 +45,8 @@ parser = argparse.ArgumentParser(
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
                     help='location of the data corpus')
 parser.add_argument('--dataset', type=str, default='wt103',
-                    choices=['wt103'],
-                    help='dataset name (only wt103 supported)')
+                    choices=['wt103', 'lm1b', 'enwik8', 'text8'],
+                    help='dataset name')
 
 # Model — Medium Transformer-XL
 parser.add_argument('--n_layer', type=int, default=16,
@@ -80,28 +69,44 @@ parser.add_argument('--dropatt', type=float, default=0.0,
                     help='attention probability dropout rate')
 
 # Initialisation
-parser.add_argument('--init', default='normal', type=str)
-parser.add_argument('--emb_init', default='normal', type=str)
-parser.add_argument('--init_range', type=float, default=0.1)
-parser.add_argument('--emb_init_range', type=float, default=0.01)
-parser.add_argument('--init_std', type=float, default=0.02)
-parser.add_argument('--proj_init_std', type=float, default=0.01)
+parser.add_argument('--init', default='normal', type=str,
+                    help='parameter initializer to use.')
+parser.add_argument('--emb_init', default='normal', type=str,
+                    help='parameter initializer to use.')
+parser.add_argument('--init_range', type=float, default=0.1,
+                    help='parameters initialized by U(-init_range, init_range)')
+parser.add_argument('--emb_init_range', type=float, default=0.01,
+                    help='parameters initialized by U(-init_range, init_range)')
+parser.add_argument('--init_std', type=float, default=0.02,
+                    help='parameters initialized by N(0, init_std)')
+parser.add_argument('--proj_init_std', type=float, default=0.01,
+                    help='parameters initialized by N(0, init_std)')
 
 # Optimiser
 parser.add_argument('--optim', default='adam', type=str,
-                    choices=['adam', 'sgd', 'adagrad'])
-parser.add_argument('--lr', type=float, default=0.00025)
-parser.add_argument('--mom', type=float, default=0.0)
+                    choices=['adam', 'sgd', 'adagrad'],
+                    help='optimizer to use.')
+parser.add_argument('--lr', type=float, default=0.00025,
+                    help='initial learning rate (0.00025|5 for adam|sgd)')
+parser.add_argument('--mom', type=float, default=0.0,
+                    help='momentum for sgd')
 parser.add_argument('--scheduler', default='cosine', type=str,
-                    choices=['cosine', 'inv_sqrt', 'dev_perf', 'constant'])
-parser.add_argument('--warmup_step', type=int, default=0)
-parser.add_argument('--decay_rate', type=float, default=0.5)
-parser.add_argument('--lr_min', type=float, default=0.0)
-parser.add_argument('--clip', type=float, default=0.25)
-parser.add_argument('--clip_nonemb', action='store_true')
+                    choices=['cosine', 'inv_sqrt', 'dev_perf', 'constant'],
+                    help='lr scheduler to use.')
+parser.add_argument('--warmup_step', type=int, default=0,
+                    help='upper epoch limit')
+parser.add_argument('--decay_rate', type=float, default=0.5,
+                    help='decay factor when ReduceLROnPlateau is used')
+parser.add_argument('--lr_min', type=float, default=0.0,
+                    help='minimum learning rate during annealing')
+parser.add_argument('--clip', type=float, default=0.25,
+                    help='gradient clipping')
+parser.add_argument('--clip_nonemb', action='store_true',
+                    help='only clip the gradient of non-embedding params')
 parser.add_argument('--max_step', type=int, default=200000,
                     help='upper step limit')
-parser.add_argument('--eta_min', type=float, default=0.0)
+parser.add_argument('--eta_min', type=float, default=0.0,
+                    help='min learning rate for cosine scheduler')
 
 # Batching — T4-safe defaults
 parser.add_argument('--batch_size', type=int, default=8,
@@ -112,21 +117,24 @@ parser.add_argument('--tgt_len', type=int, default=150,
                     help='number of tokens to predict')
 parser.add_argument('--eval_tgt_len', type=int, default=150,
                     help='number of tokens to predict for evaluation')
-parser.add_argument('--ext_len', type=int, default=0)
+parser.add_argument('--ext_len', type=int, default=0,
+                    help='length of the extended context')
 parser.add_argument('--mem_len', type=int, default=150,
                     help='length of the retained previous heads')
 
 # Embedding / softmax
-parser.add_argument('--not_tied', action='store_true')
+parser.add_argument('--not_tied', action='store_true',
+                    help='do not tie the word embedding and softmax weights')
 parser.add_argument('--adaptive', action='store_true', default=True,
                     help='use adaptive softmax (default True for wt103)')
-parser.add_argument('--div_val', type=int, default=1)
-parser.add_argument('--pre_lnorm', action='store_true')
-parser.add_argument('--sample_softmax', type=int, default=-1)
+parser.add_argument('--div_val', type=int, default=1,
+                    help='divident value for adapative input and softmax')
+parser.add_argument('--pre_lnorm', action='store_true',
+                    help='apply LayerNorm to the input instead of the output')
+parser.add_argument('--sample_softmax', type=int, default=-1,
+                    help='number of samples in sampled softmax')
 
 # MoE — BalancingLossFreeGate
-parser.add_argument('--moe', action='store_true', default=True,
-                    help='use MoE (always True for this script)')
 parser.add_argument('--moe-num-expert', type=int, default=16,
                     help='number of experts in MoE')
 parser.add_argument('--moe-top-k', type=int, default=2,
@@ -135,25 +143,43 @@ parser.add_argument('--moe_index', type=str, default=None,
                     help='comma-separated MoE layer indices (None = all)')
 
 # Misc
-parser.add_argument('--seed', type=int, default=1111)
-parser.add_argument('--cuda', action='store_true')
-parser.add_argument('--varlen', action='store_true')
-parser.add_argument('--same_length', action='store_true')
-parser.add_argument('--attn_type', type=int, default=0)
-parser.add_argument('--clamp_len', type=int, default=-1)
-parser.add_argument('--log-interval', type=int, default=200)
-parser.add_argument('--eval-interval', type=int, default=4000)
-parser.add_argument('--work_dir', default='LM-TFM-FreeLoss', type=str)
-parser.add_argument('--restart', action='store_true')
-parser.add_argument('--restart_dir', type=str, default='')
-parser.add_argument('--debug', action='store_true')
-parser.add_argument('--max_eval_steps', type=int, default=-1)
-parser.add_argument('--patience', type=int, default=0)
+parser.add_argument('--seed', type=int, default=1111, help='random seed')
+parser.add_argument('--cuda', action='store_true', help='use CUDA')
+parser.add_argument('--varlen', action='store_true', help='use variable length')
+parser.add_argument('--multi_gpu', action='store_true', help='use multiple GPU')
+parser.add_argument('--same_length', action='store_true',
+                    help='use the same attn length for all tokens')
+parser.add_argument('--attn_type', type=int, default=0,
+                    help='attention type. 0 for ours, 1 for Shaw et al,'
+                    '2 for Vaswani et al, 3 for Al Rfou et al.')
+parser.add_argument('--clamp_len', type=int, default=-1,
+                    help='use the same pos embeddings after clamp_len')
+parser.add_argument('--gpu0_bsz', type=int, default=-1,
+                    help='batch size on gpu 0')
+parser.add_argument('--log-interval', type=int, default=200,
+                    help='report interval')
+parser.add_argument('--eval-interval', type=int, default=4000,
+                    help='evaluation interval')
+parser.add_argument('--work_dir', default='LM-TFM-FreeLoss', type=str,
+                    help='experiment directory.')
+parser.add_argument('--restart', action='store_true',
+                    help='restart training from the saved checkpoint')
+parser.add_argument('--restart_dir', type=str, default='',
+                    help='restart dir')
+parser.add_argument('--debug', action='store_true',
+                    help='run in debug mode (do not create exp dir)')
+parser.add_argument('--max_eval_steps', type=int, default=-1,
+                    help='max eval steps')
+parser.add_argument('--patience', type=int, default=0, help='patience')
 
 # FP16
-parser.add_argument('--fp16', action='store_true')
-parser.add_argument('--static-loss-scale', type=float, default=1)
-parser.add_argument('--dynamic-loss-scale', action='store_true')
+parser.add_argument('--fp16', action='store_true',
+                    help='Run in pseudo-fp16 mode (fp16 storage fp32 math).')
+parser.add_argument('--static-loss-scale', type=float, default=1,
+                    help='Static loss scale, positive power of 2 values can '
+                    'improve fp16 convergence.')
+parser.add_argument('--dynamic-loss-scale', action='store_true',
+                    help='Use dynamic loss scaling.')
 
 # Freeze (gate only — no HyperRouter freezing needed)
 parser.add_argument('--freeze_gate', action='store_true')
@@ -163,7 +189,9 @@ parser.add_argument('--freeze_main_network_all', action='store_true')
 args = parser.parse_args()
 args.tied = not args.not_tied
 
-# Fixed: always use BalancingLossFreeGate
+# Fixed: always use BalancingLossFreeGate, always MoE
+args.moe = True
+args.attn_moe = False
 args.gate_name = 'BalancingLossFreeGate'
 # Not used but kept for compatibility with new_utils
 args.dense_drop = False
@@ -172,281 +200,10 @@ args.num_expert = args.moe_num_expert
 
 assert args.moe_num_expert >= args.moe_top_k, \
     "must have moe-num-expert >= moe-top-k"
-=======
-from custom_gate import BalancingLossFreeGate
-from data_utils import get_lm_corpus
-from mem_transformer import MemTransformerLM
-from utils.data_parallel import BalancedDataParallel
-from utils.exp_utils import create_exp_dir
-
-warnings.filterwarnings(action="ignore")
-
-parser = argparse.ArgumentParser(
-    description="PyTorch SMoE Transformer Language Model with BalancingLossFreeGate"
-)
-parser.add_argument(
-    "--data",
-    type=str,
-    default="../data/wikitext-103",
-    help="location of the data corpus",
-)
-parser.add_argument(
-    "--dataset",
-    type=str,
-    default="wt103",
-    choices=["wt103", "lm1b", "enwik8", "text8"],
-    help="dataset name",
-)
-parser.add_argument(
-    "--n_layer", type=int, default=12, help="number of total layers"
-)
-parser.add_argument("--n_head", type=int, default=10, help="number of heads")
-parser.add_argument("--d_head", type=int, default=50, help="head dimension")
-parser.add_argument(
-    "--d_embed", type=int, default=-1, help="embedding dimension"
-)
-parser.add_argument(
-    "--d_model", type=int, default=500, help="model dimension"
-)
-parser.add_argument(
-    "--d_inner", type=int, default=1000, help="inner dimension in FF"
-)
-parser.add_argument(
-    "--dropout", type=float, default=0.0, help="global dropout rate"
-)
-parser.add_argument(
-    "--dropatt",
-    type=float,
-    default=0.0,
-    help="attention probability dropout rate",
-)
-parser.add_argument(
-    "--init",
-    default="normal",
-    type=str,
-    help="parameter initializer to use.",
-)
-parser.add_argument(
-    "--emb_init",
-    default="normal",
-    type=str,
-    help="parameter initializer to use.",
-)
-parser.add_argument(
-    "--init_range",
-    type=float,
-    default=0.1,
-    help="parameters initialized by U(-init_range, init_range)",
-)
-parser.add_argument(
-    "--emb_init_range",
-    type=float,
-    default=0.01,
-    help="parameters initialized by U(-init_range, init_range)",
-)
-parser.add_argument(
-    "--init_std",
-    type=float,
-    default=0.02,
-    help="parameters initialized by N(0, init_std)",
-)
-parser.add_argument(
-    "--proj_init_std",
-    type=float,
-    default=0.01,
-    help="parameters initialized by N(0, init_std)",
-)
-parser.add_argument(
-    "--optim",
-    default="adam",
-    type=str,
-    choices=["adam", "sgd", "adagrad"],
-    help="optimizer to use.",
-)
-parser.add_argument(
-    "--lr",
-    type=float,
-    default=0.00025,
-    help="initial learning rate (0.00025|5 for adam|sgd)",
-)
-parser.add_argument("--mom", type=float, default=0.0, help="momentum for sgd")
-parser.add_argument(
-    "--scheduler",
-    default="cosine",
-    type=str,
-    choices=["cosine", "inv_sqrt", "dev_perf", "constant"],
-    help="lr scheduler to use.",
-)
-parser.add_argument(
-    "--warmup_step", type=int, default=0, help="upper epoch limit"
-)
-parser.add_argument(
-    "--decay_rate",
-    type=float,
-    default=0.5,
-    help="decay factor when ReduceLROnPlateau is used",
-)
-parser.add_argument(
-    "--lr_min",
-    type=float,
-    default=0.0,
-    help="minimum learning rate during annealing",
-)
-parser.add_argument(
-    "--clip", type=float, default=0.25, help="gradient clipping"
-)
-parser.add_argument(
-    "--max_step", type=int, default=100000, help="upper epoch limit"
-)
-parser.add_argument("--batch_size", type=int, default=60, help="batch size")
-parser.add_argument(
-    "--batch_chunk",
-    type=int,
-    default=1,
-    help="split batch into chunks to save memory",
-)
-parser.add_argument(
-    "--tgt_len", type=int, default=70, help="number of tokens to predict"
-)
-parser.add_argument(
-    "--eval_tgt_len",
-    type=int,
-    default=50,
-    help="number of tokens to predict for evaluation",
-)
-parser.add_argument(
-    "--ext_len", type=int, default=0, help="length of the extended context"
-)
-parser.add_argument(
-    "--mem_len",
-    type=int,
-    default=0,
-    help="length of the retained previous heads",
-)
-parser.add_argument(
-    "--not_tied",
-    action="store_true",
-    help="do not tie the word embedding and softmax weights",
-)
-parser.add_argument("--seed", type=int, default=1111, help="random seed")
-parser.add_argument("--cuda", action="store_true", help="use CUDA")
-parser.add_argument(
-    "--adaptive", action="store_true", help="use adaptive softmax"
-)
-parser.add_argument(
-    "--div_val",
-    type=int,
-    default=1,
-    help="divident value for adapative input and softmax",
-)
-parser.add_argument(
-    "--pre_lnorm",
-    action="store_true",
-    help="apply LayerNorm to the input instead of the output",
-)
-parser.add_argument(
-    "--varlen", action="store_true", help="use variable length"
-)
-parser.add_argument(
-    "--multi_gpu", action="store_true", help="use multiple GPU"
-)
-parser.add_argument(
-    "--log-interval", type=int, default=200, help="report interval"
-)
-parser.add_argument(
-    "--eval-interval", type=int, default=4000, help="evaluation interval"
-)
-parser.add_argument(
-    "--work_dir", default="LM-TFM", type=str, help="experiment directory."
-)
-parser.add_argument(
-    "--restart",
-    action="store_true",
-    help="restart training from the saved checkpoint",
-)
-parser.add_argument(
-    "--restart_dir", type=str, default="", help="restart dir"
-)
-parser.add_argument(
-    "--debug",
-    action="store_true",
-    help="run in debug mode (do not create exp dir)",
-)
-parser.add_argument(
-    "--same_length",
-    action="store_true",
-    help="use the same attn length for all tokens",
-)
-parser.add_argument(
-    "--attn_type",
-    type=int,
-    default=0,
-    help="attention type. 0 for ours, 1 for Shaw et al, 2 for Vaswani et al, 3 for Al Rfou et al.",
-)
-parser.add_argument(
-    "--clamp_len",
-    type=int,
-    default=-1,
-    help="use the same pos embeddings after clamp_len",
-)
-parser.add_argument(
-    "--eta_min",
-    type=float,
-    default=0.0,
-    help="min learning rate for cosine scheduler",
-)
-parser.add_argument(
-    "--gpu0_bsz", type=int, default=-1, help="batch size on gpu 0"
-)
-parser.add_argument(
-    "--max_eval_steps", type=int, default=-1, help="max eval steps"
-)
-parser.add_argument(
-    "--sample_softmax",
-    type=int,
-    default=-1,
-    help="number of samples in sampled softmax",
-)
-parser.add_argument("--patience", type=int, default=0, help="patience")
-parser.add_argument(
-    "--fp16",
-    action="store_true",
-    help="Run in pseudo-fp16 mode (fp16 storage fp32 math).",
-)
-parser.add_argument(
-    "--static-loss-scale",
-    type=float,
-    default=1,
-    help="Static loss scale, positive power of 2 values can improve fp16 convergence.",
-)
-parser.add_argument(
-    "--dynamic-loss-scale",
-    action="store_true",
-    help="Use dynamic loss scaling.",
-)
-parser.add_argument(
-    "--moe-num-expert", type=int, default=64, help="number of experts in MoE"
-)
-parser.add_argument(
-    "--moe-top-k",
-    type=int,
-    default=2,
-    help="top_k experts in hard gate of moe",
-)
-parser.add_argument("--moe_index", type=str, default=None, help="MoE Index")
-
-args = parser.parse_args()
-args.moe = True
-args.attn_moe = False
-args.gate_name = "BalancingLossFreeGate"
-args.tied = not args.not_tied
-assert args.moe_num_expert >= args.moe_top_k, "must have moe-num-expert >= moe-top_k"
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
 
 if args.d_embed < 0:
     args.d_embed = args.d_model
 
-<<<<<<< HEAD
 assert args.ext_len >= 0, 'extended context length must be non-negative'
 assert args.batch_size % args.batch_chunk == 0
 
@@ -459,24 +216,10 @@ logging = create_exp_dir(
 )
 
 # Reproducibility
-=======
-assert args.ext_len >= 0, "extended context length must be non-negative"
-assert args.batch_size % args.batch_chunk == 0
-
-args.work_dir = "{}-{}".format(args.work_dir, args.dataset)
-args.work_dir = os.path.join(args.work_dir, time.strftime("%Y%m%d-%H%M%S"))
-logging = create_exp_dir(
-    args.work_dir,
-    scripts_to_save=["train.py", "mem_transformer.py"],
-    debug=args.debug,
-)
-
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 if torch.cuda.is_available():
     if not args.cuda:
-<<<<<<< HEAD
         print('WARNING: You have a CUDA device, so you should probably run with --cuda')
     else:
         torch.cuda.manual_seed_all(args.seed)
@@ -485,21 +228,11 @@ if torch.cuda.is_available():
 if args.fp16:
     if not args.cuda:
         print('WARNING: --fp16 requires --cuda, ignoring --fp16 option')
-=======
-        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
-    else:
-        torch.cuda.manual_seed_all(args.seed)
-
-if args.fp16:
-    if not args.cuda:
-        print("WARNING: --fp16 requires --cuda, ignoring --fp16 option")
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
         args.fp16 = False
     else:
         try:
             from apex.fp16_utils import FP16_Optimizer
-<<<<<<< HEAD
-        except Exception:
+        except ImportError:
             print('WARNING: apex not installed, ignoring --fp16 option')
             args.fp16 = False
 
@@ -508,20 +241,11 @@ device = torch.device('cuda' if args.cuda else 'cpu')
 ###############################################################################
 # Load data
 ###############################################################################
-=======
-        except ImportError:
-            print("WARNING: apex not installed, ignoring --fp16 option")
-            args.fp16 = False
-
-device = torch.device("cuda" if args.cuda else "cpu")
-
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
 corpus = get_lm_corpus(args.data, args.dataset)
 ntokens = len(corpus.vocab)
 args.n_token = ntokens
 
 eval_batch_size = 10
-<<<<<<< HEAD
 tr_iter = corpus.get_iterator('train', args.batch_size, args.tgt_len,
                               device=device, ext_len=args.ext_len)
 va_iter = corpus.get_iterator('valid', eval_batch_size, args.eval_tgt_len,
@@ -532,9 +256,13 @@ te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
 # adaptive softmax
 cutoffs, tie_projs = [], [False]
 if args.adaptive:
-    assert args.dataset == 'wt103'
-    cutoffs = [20000, 40000, 200000]
-    tie_projs += [True] * len(cutoffs)
+    assert args.dataset in ['wt103', 'lm1b']
+    if args.dataset == 'wt103':
+        cutoffs = [20000, 40000, 200000]
+        tie_projs += [True] * len(cutoffs)
+    elif args.dataset == 'lm1b':
+        cutoffs = [60000, 100000, 640000]
+        tie_projs += [False] * len(cutoffs)
 
 ###############################################################################
 # Build the model
@@ -599,115 +327,11 @@ def update_dropatt(m):
 
 if args.moe_index is not None:
     moe_index = list(map(int, args.moe_index.split(',')))
-=======
-tr_iter = corpus.get_iterator(
-    "train",
-    args.batch_size,
-    args.tgt_len,
-    device=device,
-    ext_len=args.ext_len,
-)
-va_iter = corpus.get_iterator(
-    "valid",
-    eval_batch_size,
-    args.eval_tgt_len,
-    device=device,
-    ext_len=args.ext_len,
-)
-te_iter = corpus.get_iterator(
-    "test",
-    eval_batch_size,
-    args.eval_tgt_len,
-    device=device,
-    ext_len=args.ext_len,
-)
-
-cutoffs, tie_projs = [], [False]
-if args.adaptive:
-    assert args.dataset in ["wt103", "lm1b"]
-    if args.dataset == "wt103":
-        cutoffs = [20000, 40000, 200000]
-        tie_projs += [True] * len(cutoffs)
-    elif args.dataset == "lm1b":
-        cutoffs = [60000, 100000, 640000]
-        tie_projs += [False] * len(cutoffs)
-
-
-def init_weight(weight):
-    if args.init == "uniform":
-        nn.init.uniform_(weight, -args.init_range, args.init_range)
-    elif args.init == "normal":
-        nn.init.normal_(weight, 0.0, args.init_std)
-
-
-def init_bias(bias):
-    nn.init.constant_(bias, 0.0)
-
-
-def weights_init(m):
-    classname = m.__class__.__name__
-    if classname.find("Linear") != -1:
-        if hasattr(m, "weight") and m.weight is not None:
-            init_weight(m.weight)
-        if hasattr(m, "bias") and m.bias is not None:
-            init_bias(m.bias)
-    elif classname.find("AdaptiveEmbedding") != -1:
-        if hasattr(m, "emb_projs"):
-            for i in range(len(m.emb_projs)):
-                if m.emb_projs[i] is not None:
-                    nn.init.normal_(m.emb_projs[i], 0.0, args.proj_init_std)
-    elif classname.find("Embedding") != -1:
-        if hasattr(m, "weight"):
-            init_weight(m.weight)
-    elif classname.find("ProjectedAdaptiveLogSoftmax") != -1:
-        if hasattr(m, "cluster_weight") and m.cluster_weight is not None:
-            init_weight(m.cluster_weight)
-        if hasattr(m, "cluster_bias") and m.cluster_bias is not None:
-            init_bias(m.cluster_bias)
-        if hasattr(m, "out_projs"):
-            for i in range(len(m.out_projs)):
-                if m.out_projs[i] is not None:
-                    nn.init.normal_(m.out_projs[i], 0.0, args.proj_init_std)
-    elif classname.find("LayerNorm") != -1:
-        if hasattr(m, "weight"):
-            nn.init.normal_(m.weight, 1.0, args.init_std)
-        if hasattr(m, "bias") and m.bias is not None:
-            init_bias(m.bias)
-    elif classname.find("TransformerLM") != -1:
-        if hasattr(m, "r_emb"):
-            init_weight(m.r_emb)
-        if hasattr(m, "r_w_bias"):
-            init_weight(m.r_w_bias)
-        if hasattr(m, "r_r_bias"):
-            init_weight(m.r_r_bias)
-        if hasattr(m, "r_bias"):
-            init_bias(m.r_bias)
-
-
-def update_dropout(m):
-    classname = m.__class__.__name__
-    if classname.find("Dropout") != -1:
-        if hasattr(m, "p"):
-            m.p = args.dropout
-
-
-def update_dropatt(m):
-    if hasattr(m, "dropatt"):
-        m.dropatt.p = args.dropatt
-
-
-if args.moe_index is not None:
-    moe_index = list(map(int, args.moe_index.split(",")))
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
 else:
     moe_index = None
 
 if args.restart:
-<<<<<<< HEAD
     with open(os.path.join(args.restart_dir, 'model.pt'), 'rb') as f:
-=======
-    with open(os.path.join(args.restart_dir, "model.pt"), "rb") as f:
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
         model = torch.load(f)
     if not args.fp16:
         model = model.float()
@@ -715,7 +339,6 @@ if args.restart:
     model.apply(update_dropatt)
 else:
     model = MemTransformerLM(
-<<<<<<< HEAD
         ntokens, args.n_layer, args.n_head, args.d_model,
         args.d_head, args.d_inner, args.dropout, args.dropatt,
         tie_weight=args.tied, d_embed=args.d_embed, div_val=args.div_val,
@@ -729,38 +352,6 @@ else:
         moe_index=moe_index,
         dense_drop=False, expert_drop=0.5,
         num_expert=args.moe_num_expert, attn_moe=False,
-=======
-        ntokens,
-        args.n_layer,
-        args.n_head,
-        args.d_model,
-        args.d_head,
-        args.d_inner,
-        args.dropout,
-        args.dropatt,
-        tie_weight=args.tied,
-        d_embed=args.d_embed,
-        div_val=args.div_val,
-        tie_projs=tie_projs,
-        pre_lnorm=args.pre_lnorm,
-        tgt_len=args.tgt_len,
-        ext_len=args.ext_len,
-        mem_len=args.mem_len,
-        cutoffs=cutoffs,
-        same_length=args.same_length,
-        attn_type=args.attn_type,
-        clamp_len=args.clamp_len,
-        sample_softmax=args.sample_softmax,
-        moe=args.moe,
-        moe_num_expert=args.moe_num_expert,
-        moe_top_k=args.moe_top_k,
-        gate_name=args.gate_name,
-        moe_index=moe_index,
-        dense_drop=False,
-        expert_drop=0.0,
-        num_expert=args.moe_num_expert,
-        attn_moe=args.attn_moe,
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
     )
     model.apply(weights_init)
     model.word_emb.apply(weights_init)
@@ -768,7 +359,6 @@ else:
 args.n_all_param = sum([p.nelement() for p in model.parameters()])
 args.n_nonemb_param = sum([p.nelement() for p in model.layers.parameters()])
 
-<<<<<<< HEAD
 # Compatibility stubs
 set_threshold(model, args)
 freeze_part_weight(model, args)
@@ -777,37 +367,22 @@ print(model)
 print("Total of Params: ", sum(p.numel() for p in model.parameters()))
 print("Total of Trainable Params: ",
       sum(p.numel() for p in model.parameters() if p.requires_grad))
-=======
-print(model)
-print("Total of Params: ", sum(p.numel() for p in model.parameters()))
-print(
-    "Total of Trainable Params: ",
-    sum(p.numel() for p in model.parameters() if p.requires_grad),
-)
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
 
 if args.fp16:
     model = model.half()
 
-<<<<<<< HEAD
-para_model = model.to(device)
-
-#### optimizer
-if args.optim.lower() == 'sgd':
-=======
 if args.multi_gpu:
     model = model.to(device)
     if args.gpu0_bsz >= 0:
-        para_model = BalancedDataParallel(
-            args.gpu0_bsz // args.batch_chunk, model, dim=1
-        ).to(device)
+        para_model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk,
+                                          model, dim=1).to(device)
     else:
         para_model = nn.DataParallel(model, dim=1).to(device)
 else:
     para_model = model.to(device)
 
-if args.optim.lower() == "sgd":
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
+#### optimizer
+if args.optim.lower() == 'sgd':
     if args.sample_softmax > 0:
         dense_params, sparse_params = [], []
         for param in model.parameters():
@@ -822,16 +397,9 @@ if args.optim.lower() == "sgd":
     else:
         optimizer = optim.SGD(
             filter(lambda p: p.requires_grad, model.parameters()),
-<<<<<<< HEAD
             lr=args.lr, momentum=args.mom,
         )
 elif args.optim.lower() == 'adam':
-=======
-            lr=args.lr,
-            momentum=args.mom,
-        )
-elif args.optim.lower() == "adam":
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
     if args.sample_softmax > 0:
         dense_params, sparse_params = [], []
         for param in model.parameters():
@@ -845,7 +413,6 @@ elif args.optim.lower() == "adam":
         optimizer = optim.Adam(dense_params, lr=args.lr)
     else:
         optimizer = optim.Adam(
-<<<<<<< HEAD
             filter(lambda p: p.requires_grad, model.parameters()),
             lr=args.lr,
         )
@@ -874,58 +441,14 @@ elif args.scheduler == 'inv_sqrt':
 elif args.scheduler == 'dev_perf':
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, factor=args.decay_rate, patience=args.patience,
-=======
-            filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr
-        )
-elif args.optim.lower() == "adagrad":
-    optimizer = optim.Adagrad(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr
-    )
-
-if args.scheduler == "cosine":
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, args.max_step, eta_min=args.eta_min
-    )
-    if args.sample_softmax > 0:
-        scheduler_sparse = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer_sparse, args.max_step, eta_min=args.eta_min
-        )
-elif args.scheduler == "inv_sqrt":
-
-    def lr_lambda(step):
-        if step == 0 and args.warmup_step == 0:
-            return 1.0
-        else:
-            return (
-                1.0 / (step**0.5)
-                if step > args.warmup_step
-                else step / (args.warmup_step**1.5)
-            )
-
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-elif args.scheduler == "dev_perf":
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        factor=args.decay_rate,
-        patience=args.patience,
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
         min_lr=args.lr_min,
     )
     if args.sample_softmax > 0:
         scheduler_sparse = optim.lr_scheduler.ReduceLROnPlateau(
-<<<<<<< HEAD
             optimizer_sparse, factor=args.decay_rate,
             patience=args.patience, min_lr=args.lr_min,
         )
 elif args.scheduler == 'constant':
-=======
-            optimizer_sparse,
-            factor=args.decay_rate,
-            patience=args.patience,
-            min_lr=args.lr_min,
-        )
-elif args.scheduler == "constant":
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
     pass
 
 if args.cuda and args.fp16:
@@ -933,7 +456,6 @@ if args.cuda and args.fp16:
         optimizer,
         static_loss_scale=args.static_loss_scale,
         dynamic_loss_scale=args.dynamic_loss_scale,
-<<<<<<< HEAD
         dynamic_loss_args={'init_scale': 2 ** 16},
     )
 
@@ -968,44 +490,6 @@ def evaluate(model, eval_iter):
             args.ext_len, args.mem_len + args.tgt_len - args.eval_tgt_len)
 
     total_len, total_loss = 0, 0.
-=======
-        dynamic_loss_args={"init_scale": 2**16},
-    )
-
-if args.restart:
-    if os.path.exists(os.path.join(args.restart_dir, "optimizer.pt")):
-        with open(os.path.join(args.restart_dir, "optimizer.pt"), "rb") as f:
-            opt_state_dict = torch.load(f)
-            optimizer.load_state_dict(opt_state_dict)
-    else:
-        print("Optimizer was not saved. Start from scratch.")
-
-logging("=" * 100)
-for k, v in args.__dict__.items():
-    logging("    - {} : {}".format(k, v))
-logging("=" * 100)
-logging("#params = {}".format(args.n_all_param))
-logging("#non emb params = {}".format(args.n_nonemb_param))
-
-
-def evaluate(model, eval_iter):
-    model.eval()
-
-    if args.mem_len == 0:
-        model.reset_length(
-            args.eval_tgt_len,
-            args.ext_len + args.tgt_len - args.eval_tgt_len,
-            args.mem_len,
-        )
-    else:
-        model.reset_length(
-            args.eval_tgt_len,
-            args.ext_len,
-            args.mem_len + args.tgt_len - args.eval_tgt_len,
-        )
-
-    total_len, total_loss = 0, 0.0
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
     with torch.no_grad():
         mems = tuple()
         for i, (data, target, seq_len) in enumerate(eval_iter):
@@ -1019,21 +503,14 @@ def evaluate(model, eval_iter):
 
     model.reset_length(args.tgt_len, args.ext_len, args.mem_len)
     model.train()
-<<<<<<< HEAD
 
-=======
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
     return total_loss / total_len
 
 
 def train():
-<<<<<<< HEAD
     """Run one epoch of training."""
     global train_step, train_loss, best_val_loss, best_val_loss_dense
     global eval_start_time, log_start_time, all_top_k
-=======
-    global train_step, train_loss, best_val_loss, eval_start_time, log_start_time
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
     model.train()
 
     if args.batch_chunk > 1:
@@ -1043,16 +520,12 @@ def train():
     train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
 
     for batch, (data, target, seq_len) in enumerate(train_iter):
-<<<<<<< HEAD
 
         current_top_k = collect_top_k(model)
         all_top_k.append(current_top_k)
 
         model.zero_grad()
 
-=======
-        model.zero_grad()
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
         if args.batch_chunk > 1:
             data_chunks = torch.chunk(data, args.batch_chunk, 1)
             target_chunks = torch.chunk(target, args.batch_chunk, 1)
@@ -1071,12 +544,8 @@ def train():
             ret = para_model(data, target, *mems)
             loss, mems = ret[0], ret[1:]
             loss = loss.float().mean().type_as(loss)
-<<<<<<< HEAD
             # No auxiliary balancing loss needed — BalancingLossFreeGate
             # handles balance via EMA memory, not via loss term.
-=======
-
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
             if args.fp16:
                 optimizer.backward(loss)
             else:
@@ -1092,7 +561,6 @@ def train():
         if args.sample_softmax > 0:
             optimizer_sparse.step()
 
-<<<<<<< HEAD
         # Finalize EMA step for BalancingLossFreeGate
         if hasattr(model, 'balancing_state') and model.balancing_state is not None:
             model.balancing_state.finalize_step()
@@ -1111,59 +579,24 @@ def train():
                     if args.sample_softmax > 0:
                         scheduler_sparse.step(train_step)
         elif args.scheduler == 'inv_sqrt':
-=======
-        if hasattr(model, "balancing_state") and model.balancing_state is not None:
-            model.balancing_state.finalize_step()
-
-        train_step += 1
-        if args.scheduler in ["cosine", "constant", "dev_perf"]:
-            if train_step < args.warmup_step:
-                curr_lr = args.lr * train_step / args.warmup_step
-                optimizer.param_groups[0]["lr"] = curr_lr
-                if args.sample_softmax > 0:
-                    optimizer_sparse.param_groups[0]["lr"] = curr_lr * 2
-            else:
-                if args.scheduler == "cosine":
-                    scheduler.step(train_step)
-                    if args.sample_softmax > 0:
-                        scheduler_sparse.step(train_step)
-        elif args.scheduler == "inv_sqrt":
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
             scheduler.step(train_step)
 
         if train_step % args.log_interval == 1:
             cur_loss = train_loss / args.log_interval
             elapsed = time.time() - log_start_time
-<<<<<<< HEAD
             log_str = '| epoch {:3d} step {:>8d} | {:>6d} batches | lr {:.3g} ' \
                       '| ms/batch {:5.2f} | loss {:5.2f}'.format(
                 epoch, train_step, batch + 1, optimizer.param_groups[0]['lr'],
                 elapsed * 1000 / args.log_interval, cur_loss)
-            log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
-=======
-
-            log_str = (
-                "| epoch {:3d} step {:>8d} | {:>6d} batches | lr {:.3g} "
-                "| ms/batch {:5.2f} | loss {:5.2f}".format(
-                    epoch,
-                    train_step,
-                    batch + 1,
-                    optimizer.param_groups[0]["lr"],
-                    elapsed * 1000 / args.log_interval,
-                    cur_loss,
-                )
-            )
-            if args.dataset in ["enwik8", "text8"]:
-                log_str += " | bpc {:9.5f}".format(cur_loss / math.log(2))
+            if args.dataset in ['enwik8', 'text8']:
+                log_str += ' | bpc {:9.5f}'.format(cur_loss / math.log(2))
             else:
-                log_str += " | ppl {:9.3f}".format(math.exp(cur_loss))
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
+                log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
             logging(log_str)
             train_loss = 0
             log_start_time = time.time()
 
         if train_step % args.eval_interval == 0:
-<<<<<<< HEAD
             # Dense evaluation (all experts)
             current_gate = set_router_mode(model, args, flag=True)
             val_loss_dense = evaluate(model, va_iter)
@@ -1176,7 +609,10 @@ def train():
                       '| valid loss {:5.2f}'.format(
                 train_step // args.eval_interval, train_step,
                 (time.time() - eval_start_time), val_loss)
-            log_str += ' | valid ppl {:9.3f}'.format(math.exp(val_loss))
+            if args.dataset in ['enwik8', 'text8']:
+                log_str += ' | bpc {:9.5f}'.format(val_loss / math.log(2))
+            else:
+                log_str += ' | valid ppl {:9.3f}'.format(math.exp(val_loss))
             logging(log_str)
             logging('-' * 100)
 
@@ -1184,7 +620,10 @@ def train():
                       '| Dense valid loss {:5.2f}'.format(
                 train_step // args.eval_interval, train_step,
                 (time.time() - eval_start_time), val_loss_dense)
-            log_str_dense += ' | valid ppl {:9.3f}'.format(math.exp(val_loss_dense))
+            if args.dataset in ['enwik8', 'text8']:
+                log_str_dense += ' | bpc {:9.5f}'.format(val_loss_dense / math.log(2))
+            else:
+                log_str_dense += ' | valid ppl {:9.3f}'.format(math.exp(val_loss_dense))
             logging(log_str_dense)
             logging('-' * 100)
 
@@ -1208,40 +647,6 @@ def train():
 
             # dev-performance based learning rate annealing
             if args.scheduler == 'dev_perf':
-=======
-            val_loss = evaluate(model, va_iter)
-
-            logging("-" * 100)
-            log_str = (
-                "| Eval {:3d} at step {:>8d} | time: {:5.2f}s "
-                "| valid loss {:5.2f}".format(
-                    train_step // args.eval_interval,
-                    train_step,
-                    (time.time() - eval_start_time),
-                    val_loss,
-                )
-            )
-            if args.dataset in ["enwik8", "text8"]:
-                log_str += " | bpc {:9.5f}".format(val_loss / math.log(2))
-            else:
-                log_str += " | valid ppl {:9.3f}".format(math.exp(val_loss))
-            logging(log_str)
-            logging("-" * 100)
-
-            if not best_val_loss or val_loss < best_val_loss:
-                if not args.debug:
-                    with open(
-                        os.path.join(args.work_dir, "model.pt"), "wb"
-                    ) as f:
-                        torch.save(model, f)
-                    with open(
-                        os.path.join(args.work_dir, "optimizer.pt"), "wb"
-                    ) as f:
-                        torch.save(optimizer.state_dict(), f)
-                best_val_loss = val_loss
-
-            if args.scheduler == "dev_perf":
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
                 scheduler.step(val_loss)
                 if args.sample_softmax > 0:
                     scheduler_sparse.step(val_loss)
@@ -1252,7 +657,6 @@ def train():
             break
 
 
-<<<<<<< HEAD
 # ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
@@ -1263,19 +667,11 @@ best_val_loss_dense = None
 log_start_time = time.time()
 eval_start_time = time.time()
 all_top_k = []
-=======
-train_step = 0
-train_loss = 0
-best_val_loss = None
-log_start_time = time.time()
-eval_start_time = time.time()
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
 
 try:
     for epoch in itertools.count(start=1):
         train()
         if train_step == args.max_step:
-<<<<<<< HEAD
             logging('-' * 100)
             logging('End of training')
             break
@@ -1296,9 +692,14 @@ for gate_number in [1, 2, 4, 8, 16]:
         set_top_k(model, gate_number)
         test_loss = evaluate(model, te_iter)
         logging('=' * 100)
-        logging('Dense | End of training | Gate-Number {:.0f} '
-                '| test loss {:5.2f} | test ppl {:9.3f}'.format(
-                    gate_number, test_loss, math.exp(test_loss)))
+        if args.dataset in ['enwik8', 'text8']:
+            logging('Dense | End of training | Gate-Number {:.0f} '
+                    '| test loss {:5.2f} | test bpc {:9.5f}'.format(
+                        gate_number, test_loss, test_loss / math.log(2)))
+        else:
+            logging('Dense | End of training | Gate-Number {:.0f} '
+                    '| test loss {:5.2f} | test ppl {:9.3f}'.format(
+                        gate_number, test_loss, math.exp(test_loss)))
         logging('=' * 100)
 
 # ---------------------------------------------------------------------------
@@ -1313,38 +714,15 @@ for gate_number in [1, 2, 4, 8, 16]:
         set_top_k(model, gate_number)
         test_loss = evaluate(model, te_iter)
         logging('=' * 100)
-        logging('| End of training | Gate-Number {:.0f} '
-                '| test loss {:5.2f} | test ppl {:9.3f}'.format(
-                    gate_number, test_loss, math.exp(test_loss)))
+        if args.dataset in ['enwik8', 'text8']:
+            logging('| End of training | Gate-Number {:.0f} '
+                    '| test loss {:5.2f} | test bpc {:9.5f}'.format(
+                        gate_number, test_loss, test_loss / math.log(2)))
+        else:
+            logging('| End of training | Gate-Number {:.0f} '
+                    '| test loss {:5.2f} | test ppl {:9.3f}'.format(
+                        gate_number, test_loss, math.exp(test_loss)))
         logging('=' * 100)
 
 all_top_k = np.array(all_top_k)
 print('* Mean Top-K During Training = {}-[{}]'.format(all_top_k, all_top_k))
-=======
-            logging("-" * 100)
-            logging("End of training")
-            break
-except KeyboardInterrupt:
-    logging("-" * 100)
-    logging("Exiting from training early")
-
-with open(os.path.join(args.work_dir, "model.pt"), "rb") as f:
-    model = torch.load(f)
-para_model = model.to(device)
-
-test_loss = evaluate(model, te_iter)
-logging("=" * 100)
-if args.dataset in ["enwik8", "text8"]:
-    logging(
-        "| End of training | test loss {:5.2f} | test bpc {:9.5f}".format(
-            test_loss, test_loss / math.log(2)
-        )
-    )
-else:
-    logging(
-        "| End of training | test loss {:5.2f} | test ppl {:9.3f}".format(
-            test_loss, math.exp(test_loss)
-        )
-    )
-logging("=" * 100)
->>>>>>> 36eae18e3c57335e0747e30085fb860190d8c77f
