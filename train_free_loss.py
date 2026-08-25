@@ -348,7 +348,7 @@ else:
         clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,
         moe=args.moe, moe_num_expert=args.moe_num_expert,
         moe_top_k=args.moe_top_k,
-        gate_name=BalancingLossFreeGate,   # pass class directly
+        gate_name='BalancingLossFreeGate',  # string — eval()'d inside mem_transformer
         moe_index=moe_index,
         dense_drop=False, expert_drop=0.5,
         num_expert=args.moe_num_expert, attn_moe=False,
