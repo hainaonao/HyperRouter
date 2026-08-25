@@ -24,6 +24,7 @@ import torch.optim as optim
 from data_utils import get_lm_corpus
 from mem_transformer import MemTransformerLM
 from utils.exp_utils import create_exp_dir
+from utils.data_parallel import BalancedDataParallel
 from custom_gate import BalancingLossFreeGate
 from new_utils import (
     set_top_k, set_router_mode, freeze_part_weight,
@@ -44,8 +45,8 @@ parser = argparse.ArgumentParser(
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
                     help='location of the data corpus')
 parser.add_argument('--dataset', type=str, default='wt103',
-                    choices=['wt103'],
-                    help='dataset name (only wt103 supported)')
+                    choices=['wt103', 'lm1b', 'enwik8', 'text8'],
+                    help='dataset name')
 
 # Model — Medium Transformer-XL
 parser.add_argument('--n_layer', type=int, default=16,
@@ -68,28 +69,44 @@ parser.add_argument('--dropatt', type=float, default=0.0,
                     help='attention probability dropout rate')
 
 # Initialisation
-parser.add_argument('--init', default='normal', type=str)
-parser.add_argument('--emb_init', default='normal', type=str)
-parser.add_argument('--init_range', type=float, default=0.1)
-parser.add_argument('--emb_init_range', type=float, default=0.01)
-parser.add_argument('--init_std', type=float, default=0.02)
-parser.add_argument('--proj_init_std', type=float, default=0.01)
+parser.add_argument('--init', default='normal', type=str,
+                    help='parameter initializer to use.')
+parser.add_argument('--emb_init', default='normal', type=str,
+                    help='parameter initializer to use.')
+parser.add_argument('--init_range', type=float, default=0.1,
+                    help='parameters initialized by U(-init_range, init_range)')
+parser.add_argument('--emb_init_range', type=float, default=0.01,
+                    help='parameters initialized by U(-init_range, init_range)')
+parser.add_argument('--init_std', type=float, default=0.02,
+                    help='parameters initialized by N(0, init_std)')
+parser.add_argument('--proj_init_std', type=float, default=0.01,
+                    help='parameters initialized by N(0, init_std)')
 
 # Optimiser
 parser.add_argument('--optim', default='adam', type=str,
-                    choices=['adam', 'sgd', 'adagrad'])
-parser.add_argument('--lr', type=float, default=0.00025)
-parser.add_argument('--mom', type=float, default=0.0)
+                    choices=['adam', 'sgd', 'adagrad'],
+                    help='optimizer to use.')
+parser.add_argument('--lr', type=float, default=0.00025,
+                    help='initial learning rate (0.00025|5 for adam|sgd)')
+parser.add_argument('--mom', type=float, default=0.0,
+                    help='momentum for sgd')
 parser.add_argument('--scheduler', default='cosine', type=str,
-                    choices=['cosine', 'inv_sqrt', 'dev_perf', 'constant'])
-parser.add_argument('--warmup_step', type=int, default=0)
-parser.add_argument('--decay_rate', type=float, default=0.5)
-parser.add_argument('--lr_min', type=float, default=0.0)
-parser.add_argument('--clip', type=float, default=0.25)
-parser.add_argument('--clip_nonemb', action='store_true')
+                    choices=['cosine', 'inv_sqrt', 'dev_perf', 'constant'],
+                    help='lr scheduler to use.')
+parser.add_argument('--warmup_step', type=int, default=0,
+                    help='upper epoch limit')
+parser.add_argument('--decay_rate', type=float, default=0.5,
+                    help='decay factor when ReduceLROnPlateau is used')
+parser.add_argument('--lr_min', type=float, default=0.0,
+                    help='minimum learning rate during annealing')
+parser.add_argument('--clip', type=float, default=0.25,
+                    help='gradient clipping')
+parser.add_argument('--clip_nonemb', action='store_true',
+                    help='only clip the gradient of non-embedding params')
 parser.add_argument('--max_step', type=int, default=200000,
                     help='upper step limit')
-parser.add_argument('--eta_min', type=float, default=0.0)
+parser.add_argument('--eta_min', type=float, default=0.0,
+                    help='min learning rate for cosine scheduler')
 
 # Batching — T4-safe defaults
 parser.add_argument('--batch_size', type=int, default=8,
@@ -100,21 +117,24 @@ parser.add_argument('--tgt_len', type=int, default=150,
                     help='number of tokens to predict')
 parser.add_argument('--eval_tgt_len', type=int, default=150,
                     help='number of tokens to predict for evaluation')
-parser.add_argument('--ext_len', type=int, default=0)
+parser.add_argument('--ext_len', type=int, default=0,
+                    help='length of the extended context')
 parser.add_argument('--mem_len', type=int, default=150,
                     help='length of the retained previous heads')
 
 # Embedding / softmax
-parser.add_argument('--not_tied', action='store_true')
+parser.add_argument('--not_tied', action='store_true',
+                    help='do not tie the word embedding and softmax weights')
 parser.add_argument('--adaptive', action='store_true', default=True,
                     help='use adaptive softmax (default True for wt103)')
-parser.add_argument('--div_val', type=int, default=1)
-parser.add_argument('--pre_lnorm', action='store_true')
-parser.add_argument('--sample_softmax', type=int, default=-1)
+parser.add_argument('--div_val', type=int, default=1,
+                    help='divident value for adapative input and softmax')
+parser.add_argument('--pre_lnorm', action='store_true',
+                    help='apply LayerNorm to the input instead of the output')
+parser.add_argument('--sample_softmax', type=int, default=-1,
+                    help='number of samples in sampled softmax')
 
 # MoE — BalancingLossFreeGate
-parser.add_argument('--moe', action='store_true', default=True,
-                    help='use MoE (always True for this script)')
 parser.add_argument('--moe-num-expert', type=int, default=16,
                     help='number of experts in MoE')
 parser.add_argument('--moe-top-k', type=int, default=2,
@@ -123,25 +143,43 @@ parser.add_argument('--moe_index', type=str, default=None,
                     help='comma-separated MoE layer indices (None = all)')
 
 # Misc
-parser.add_argument('--seed', type=int, default=1111)
-parser.add_argument('--cuda', action='store_true')
-parser.add_argument('--varlen', action='store_true')
-parser.add_argument('--same_length', action='store_true')
-parser.add_argument('--attn_type', type=int, default=0)
-parser.add_argument('--clamp_len', type=int, default=-1)
-parser.add_argument('--log-interval', type=int, default=200)
-parser.add_argument('--eval-interval', type=int, default=4000)
-parser.add_argument('--work_dir', default='LM-TFM-FreeLoss', type=str)
-parser.add_argument('--restart', action='store_true')
-parser.add_argument('--restart_dir', type=str, default='')
-parser.add_argument('--debug', action='store_true')
-parser.add_argument('--max_eval_steps', type=int, default=-1)
-parser.add_argument('--patience', type=int, default=0)
+parser.add_argument('--seed', type=int, default=1111, help='random seed')
+parser.add_argument('--cuda', action='store_true', help='use CUDA')
+parser.add_argument('--varlen', action='store_true', help='use variable length')
+parser.add_argument('--multi_gpu', action='store_true', help='use multiple GPU')
+parser.add_argument('--same_length', action='store_true',
+                    help='use the same attn length for all tokens')
+parser.add_argument('--attn_type', type=int, default=0,
+                    help='attention type. 0 for ours, 1 for Shaw et al,'
+                    '2 for Vaswani et al, 3 for Al Rfou et al.')
+parser.add_argument('--clamp_len', type=int, default=-1,
+                    help='use the same pos embeddings after clamp_len')
+parser.add_argument('--gpu0_bsz', type=int, default=-1,
+                    help='batch size on gpu 0')
+parser.add_argument('--log-interval', type=int, default=200,
+                    help='report interval')
+parser.add_argument('--eval-interval', type=int, default=4000,
+                    help='evaluation interval')
+parser.add_argument('--work_dir', default='LM-TFM-FreeLoss', type=str,
+                    help='experiment directory.')
+parser.add_argument('--restart', action='store_true',
+                    help='restart training from the saved checkpoint')
+parser.add_argument('--restart_dir', type=str, default='',
+                    help='restart dir')
+parser.add_argument('--debug', action='store_true',
+                    help='run in debug mode (do not create exp dir)')
+parser.add_argument('--max_eval_steps', type=int, default=-1,
+                    help='max eval steps')
+parser.add_argument('--patience', type=int, default=0, help='patience')
 
 # FP16
-parser.add_argument('--fp16', action='store_true')
-parser.add_argument('--static-loss-scale', type=float, default=1)
-parser.add_argument('--dynamic-loss-scale', action='store_true')
+parser.add_argument('--fp16', action='store_true',
+                    help='Run in pseudo-fp16 mode (fp16 storage fp32 math).')
+parser.add_argument('--static-loss-scale', type=float, default=1,
+                    help='Static loss scale, positive power of 2 values can '
+                    'improve fp16 convergence.')
+parser.add_argument('--dynamic-loss-scale', action='store_true',
+                    help='Use dynamic loss scaling.')
 
 # Freeze (gate only — no HyperRouter freezing needed)
 parser.add_argument('--freeze_gate', action='store_true')
@@ -151,7 +189,9 @@ parser.add_argument('--freeze_main_network_all', action='store_true')
 args = parser.parse_args()
 args.tied = not args.not_tied
 
-# Fixed: always use BalancingLossFreeGate
+# Fixed: always use BalancingLossFreeGate, always MoE
+args.moe = True
+args.attn_moe = False
 args.gate_name = 'BalancingLossFreeGate'
 # Not used but kept for compatibility with new_utils
 args.dense_drop = False
@@ -192,7 +232,7 @@ if args.fp16:
     else:
         try:
             from apex.fp16_utils import FP16_Optimizer
-        except Exception:
+        except ImportError:
             print('WARNING: apex not installed, ignoring --fp16 option')
             args.fp16 = False
 
@@ -216,9 +256,13 @@ te_iter = corpus.get_iterator('test', eval_batch_size, args.eval_tgt_len,
 # adaptive softmax
 cutoffs, tie_projs = [], [False]
 if args.adaptive:
-    assert args.dataset == 'wt103'
-    cutoffs = [20000, 40000, 200000]
-    tie_projs += [True] * len(cutoffs)
+    assert args.dataset in ['wt103', 'lm1b']
+    if args.dataset == 'wt103':
+        cutoffs = [20000, 40000, 200000]
+        tie_projs += [True] * len(cutoffs)
+    elif args.dataset == 'lm1b':
+        cutoffs = [60000, 100000, 640000]
+        tie_projs += [False] * len(cutoffs)
 
 ###############################################################################
 # Build the model
@@ -304,7 +348,7 @@ else:
         clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,
         moe=args.moe, moe_num_expert=args.moe_num_expert,
         moe_top_k=args.moe_top_k,
-        gate_name=BalancingLossFreeGate,   # pass class directly
+        gate_name='BalancingLossFreeGate',  # string — eval()'d inside mem_transformer
         moe_index=moe_index,
         dense_drop=False, expert_drop=0.5,
         num_expert=args.moe_num_expert, attn_moe=False,
@@ -327,7 +371,15 @@ print("Total of Trainable Params: ",
 if args.fp16:
     model = model.half()
 
-para_model = model.to(device)
+if args.multi_gpu:
+    model = model.to(device)
+    if args.gpu0_bsz >= 0:
+        para_model = BalancedDataParallel(args.gpu0_bsz // args.batch_chunk,
+                                          model, dim=1).to(device)
+    else:
+        para_model = nn.DataParallel(model, dim=1).to(device)
+else:
+    para_model = model.to(device)
 
 #### optimizer
 if args.optim.lower() == 'sgd':
@@ -536,7 +588,10 @@ def train():
                       '| ms/batch {:5.2f} | loss {:5.2f}'.format(
                 epoch, train_step, batch + 1, optimizer.param_groups[0]['lr'],
                 elapsed * 1000 / args.log_interval, cur_loss)
-            log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
+            if args.dataset in ['enwik8', 'text8']:
+                log_str += ' | bpc {:9.5f}'.format(cur_loss / math.log(2))
+            else:
+                log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
             logging(log_str)
             train_loss = 0
             log_start_time = time.time()
@@ -554,7 +609,10 @@ def train():
                       '| valid loss {:5.2f}'.format(
                 train_step // args.eval_interval, train_step,
                 (time.time() - eval_start_time), val_loss)
-            log_str += ' | valid ppl {:9.3f}'.format(math.exp(val_loss))
+            if args.dataset in ['enwik8', 'text8']:
+                log_str += ' | bpc {:9.5f}'.format(val_loss / math.log(2))
+            else:
+                log_str += ' | valid ppl {:9.3f}'.format(math.exp(val_loss))
             logging(log_str)
             logging('-' * 100)
 
@@ -562,7 +620,10 @@ def train():
                       '| Dense valid loss {:5.2f}'.format(
                 train_step // args.eval_interval, train_step,
                 (time.time() - eval_start_time), val_loss_dense)
-            log_str_dense += ' | valid ppl {:9.3f}'.format(math.exp(val_loss_dense))
+            if args.dataset in ['enwik8', 'text8']:
+                log_str_dense += ' | bpc {:9.5f}'.format(val_loss_dense / math.log(2))
+            else:
+                log_str_dense += ' | valid ppl {:9.3f}'.format(math.exp(val_loss_dense))
             logging(log_str_dense)
             logging('-' * 100)
 
@@ -631,9 +692,14 @@ for gate_number in [1, 2, 4, 8, 16]:
         set_top_k(model, gate_number)
         test_loss = evaluate(model, te_iter)
         logging('=' * 100)
-        logging('Dense | End of training | Gate-Number {:.0f} '
-                '| test loss {:5.2f} | test ppl {:9.3f}'.format(
-                    gate_number, test_loss, math.exp(test_loss)))
+        if args.dataset in ['enwik8', 'text8']:
+            logging('Dense | End of training | Gate-Number {:.0f} '
+                    '| test loss {:5.2f} | test bpc {:9.5f}'.format(
+                        gate_number, test_loss, test_loss / math.log(2)))
+        else:
+            logging('Dense | End of training | Gate-Number {:.0f} '
+                    '| test loss {:5.2f} | test ppl {:9.3f}'.format(
+                        gate_number, test_loss, math.exp(test_loss)))
         logging('=' * 100)
 
 # ---------------------------------------------------------------------------
@@ -648,9 +714,14 @@ for gate_number in [1, 2, 4, 8, 16]:
         set_top_k(model, gate_number)
         test_loss = evaluate(model, te_iter)
         logging('=' * 100)
-        logging('| End of training | Gate-Number {:.0f} '
-                '| test loss {:5.2f} | test ppl {:9.3f}'.format(
-                    gate_number, test_loss, math.exp(test_loss)))
+        if args.dataset in ['enwik8', 'text8']:
+            logging('| End of training | Gate-Number {:.0f} '
+                    '| test loss {:5.2f} | test bpc {:9.5f}'.format(
+                        gate_number, test_loss, test_loss / math.log(2)))
+        else:
+            logging('| End of training | Gate-Number {:.0f} '
+                    '| test loss {:5.2f} | test ppl {:9.3f}'.format(
+                        gate_number, test_loss, math.exp(test_loss)))
         logging('=' * 100)
 
 all_top_k = np.array(all_top_k)
