@@ -93,10 +93,11 @@ class BalancingLossFreeState:
         logits_mean = logits_mean.detach()
 
         if layer_idx not in self._accum_sum:
-            self._accum_sum[layer_idx] = logits_mean.clone()
+            # Store on CPU to avoid device conflicts with DataParallel
+            self._accum_sum[layer_idx] = logits_mean.clone().cpu()
             self._accum_count[layer_idx] = 1
         else:
-            self._accum_sum[layer_idx] += logits_mean
+            self._accum_sum[layer_idx] += logits_mean.cpu()
             self._accum_count[layer_idx] += 1
 
     def get_rc(self, layer_idx: int, device: torch.device) -> torch.Tensor:

@@ -356,7 +356,7 @@ def get_lm_corpus(datadir, dataset):
     fn = os.path.join(datadir, 'cache.pt')
     if os.path.exists(fn):
         print('Loading cached dataset...')
-        corpus = torch.load(fn)
+        corpus = torch.load(fn, weights_only=False)
     else:
         print('Producing dataset {}...'.format(dataset))
         kwargs = {}
