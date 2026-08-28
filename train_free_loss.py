@@ -29,6 +29,7 @@ from custom_gate import BalancingLossFreeGate
 from new_utils import (
     set_top_k, set_router_mode, freeze_part_weight,
     set_threshold, collect_top_k,
+    get_routing_decisions_all_layers, compute_layer_fluctuations,
 )
 
 import warnings
@@ -510,7 +511,7 @@ def evaluate(model, eval_iter):
 def train():
     """Run one epoch of training."""
     global train_step, train_loss, best_val_loss, best_val_loss_dense
-    global eval_start_time, log_start_time, all_top_k
+    global eval_start_time, log_start_time, all_top_k, prev_routing_decisions
     model.train()
 
     if args.batch_chunk > 1:
@@ -596,6 +597,21 @@ def train():
             train_loss = 0
             log_start_time = time.time()
 
+        # Log routing fluctuation every 1000 steps
+        if train_step % 1000 == 0:
+            curr_routing_decisions = get_routing_decisions_all_layers(
+                model, data, target, *mems)
+            if prev_routing_decisions is not None:
+                fluctuations = compute_layer_fluctuations(
+                    curr_routing_decisions, prev_routing_decisions)
+                if fluctuations:
+                    fluc_strs = ['{}: {:.4f}'.format(k, v)
+                                 for k, v in sorted(fluctuations.items())]
+                    avg_fluc = sum(fluctuations.values()) / len(fluctuations)
+                    logging('| Routing Fluctuation at step {:>8d} | avg {:.4f} | {}'.format(
+                        train_step, avg_fluc, ' | '.join(fluc_strs)))
+            prev_routing_decisions = curr_routing_decisions
+
         if train_step % args.eval_interval == 0:
             # Dense evaluation (all experts)
             current_gate = set_router_mode(model, args, flag=True)
@@ -667,6 +683,7 @@ best_val_loss_dense = None
 log_start_time = time.time()
 eval_start_time = time.time()
 all_top_k = []
+prev_routing_decisions = None
 
 try:
     for epoch in itertools.count(start=1):
