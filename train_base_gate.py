@@ -341,7 +341,7 @@ else:
 
 if args.restart:
     with open(os.path.join(args.restart_dir, 'model.pt'), 'rb') as f:
-        model = torch.load(f)
+        model = torch.load(f, weights_only=False)
     if not args.fp16:
         model = model.float()
     model.apply(update_dropout)
@@ -471,7 +471,7 @@ if args.cuda and args.fp16:
 if args.restart:
     if os.path.exists(os.path.join(args.restart_dir, 'optimizer.pt')):
         with open(os.path.join(args.restart_dir, 'optimizer.pt'), 'rb') as f:
-            opt_state_dict = torch.load(f)
+            opt_state_dict = torch.load(f, weights_only=False)
             optimizer.load_state_dict(opt_state_dict)
     else:
         print('Optimizer was not saved. Start from scratch.')
@@ -749,7 +749,7 @@ except KeyboardInterrupt:
 # Final evaluation on test set — Dense model
 # ---------------------------------------------------------------------------
 with open(os.path.join(args.work_dir, 'model_dense.pt'), 'rb') as f:
-    model = torch.load(f)
+    model = torch.load(f, weights_only=False)
 para_model = model.to(device)
 
 for gate_number in [1, 2, 4, 8, 16]:
@@ -771,7 +771,7 @@ for gate_number in [1, 2, 4, 8, 16]:
 # Final evaluation on test set — Sparse (best val) model
 # ---------------------------------------------------------------------------
 with open(os.path.join(args.work_dir, 'model.pt'), 'rb') as f:
-    model = torch.load(f)
+    model = torch.load(f, weights_only=False)
 para_model = model.to(device)
 
 for gate_number in [1, 2, 4, 8, 16]:
