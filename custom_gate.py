@@ -183,6 +183,9 @@ class CustomNaiveGate_Balance(BaseGate):
 
         gate_score = F.softmax(gate_top_k_val, dim=-1)
 
+        # Cache for external metric computation (e.g., fluctuation)
+        self.last_top_k_idx = gate_top_k_idx.detach()
+
         self.set_load_balance(gate, gate_top_k_idx)
 
         if return_all_scores:
