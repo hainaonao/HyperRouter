@@ -570,7 +570,7 @@ def train():
                 if args.load_balance > 0:
                     balance_loss = 0
                     for name, m in model.named_modules():
-                        if isinstance(m, CustomNaiveGate_Balance):
+                        if isinstance(m, CustomNaiveGate_Balance) and m.loss is not None:
                             balance_loss += m.loss
                     loss += args.load_balance * balance_loss / args.batch_chunk
 
@@ -588,7 +588,7 @@ def train():
             if args.load_balance > 0:
                 balance_loss = 0
                 for name, m in model.named_modules():
-                    if isinstance(m, CustomNaiveGate_Balance):
+                    if isinstance(m, CustomNaiveGate_Balance) and m.loss is not None:
                         balance_loss += m.loss
                 loss += args.load_balance * balance_loss
 
