@@ -1,10 +1,14 @@
 # coding: utf-8
 """
-Training script for BalancingLossFreeGate on WikiText-103.
-Configured for Medium Transformer-XL on a single T4 GPU (16 GB).
+Baseline training script using CustomNaiveGate_Balance WITHOUT auxiliary
+balancing loss on WikiText-103.
+
+Same model architecture & config as train_base_gate.py, but the auxiliary
+balancing loss is NOT added to the training loss.  This isolates the effect
+of the balancing loss itself for comparison.
 
 Usage:
-    python train_free_loss.py \
+    python train_base_gate_no_lbl.py \
         --cuda \
         --data /path/to/wt103 \
         --dataset wt103
@@ -26,7 +30,7 @@ from data_utils import get_lm_corpus
 from mem_transformer import MemTransformerLM
 from utils.exp_utils import create_exp_dir
 from utils.data_parallel import BalancedDataParallel
-from custom_gate import BalancingLossFreeGate
+from custom_gate import CustomNaiveGate_Balance
 from new_utils import (
     set_top_k, set_router_mode, freeze_part_weight,
     set_threshold, collect_top_k,
@@ -37,10 +41,12 @@ import warnings
 warnings.filterwarnings(action='ignore')
 
 # ---------------------------------------------------------------------------
-# Arguments — Medium Transformer-XL + BalancingLossFreeGate defaults
+# Arguments — Medium Transformer-XL + CustomNaiveGate_Balance defaults
+# (Same architecture as train_free_loss.py for fair comparison)
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(
-    description='Train Medium Transformer-XL with BalancingLossFreeGate on WikiText-103'
+    description='Baseline: Train Medium Transformer-XL with '
+                'CustomNaiveGate_Balance (auxiliary balancing loss) on WikiText-103'
 )
 
 # Data
@@ -50,7 +56,7 @@ parser.add_argument('--dataset', type=str, default='wt103',
                     choices=['wt103', 'lm1b', 'enwik8', 'text8'],
                     help='dataset name')
 
-# Model — Medium Transformer-XL
+# Model — Medium Transformer-XL (identical to train_free_loss.py)
 parser.add_argument('--n_layer', type=int, default=16,
                     help='number of total layers')
 parser.add_argument('--n_head', type=int, default=10,
@@ -110,7 +116,7 @@ parser.add_argument('--max_step', type=int, default=200000,
 parser.add_argument('--eta_min', type=float, default=0.0,
                     help='min learning rate for cosine scheduler')
 
-# Batching — T4-safe defaults
+# Batching — T4-safe defaults (identical to train_free_loss.py)
 parser.add_argument('--batch_size', type=int, default=8,
                     help='batch size (kept small for T4 16GB)')
 parser.add_argument('--batch_chunk', type=int, default=2,
@@ -136,13 +142,16 @@ parser.add_argument('--pre_lnorm', action='store_true',
 parser.add_argument('--sample_softmax', type=int, default=-1,
                     help='number of samples in sampled softmax')
 
-# MoE — BalancingLossFreeGate
+# MoE — CustomNaiveGate_Balance (same expert config as train_free_loss.py)
 parser.add_argument('--moe-num-expert', type=int, default=16,
                     help='number of experts in MoE')
 parser.add_argument('--moe-top-k', type=int, default=2,
                     help='top_k experts in gate')
 parser.add_argument('--moe_index', type=str, default=None,
                     help='comma-separated MoE layer indices (None = all)')
+parser.add_argument('--load_balance', type=float, default=0.01,
+                    help='coefficient for auxiliary balancing loss '
+                         '(0 = no balancing loss)')
 
 # Misc
 parser.add_argument('--seed', type=int, default=1111, help='random seed')
@@ -162,7 +171,7 @@ parser.add_argument('--log-interval', type=int, default=200,
                     help='report interval')
 parser.add_argument('--eval-interval', type=int, default=4000,
                     help='evaluation interval')
-parser.add_argument('--work_dir', default='LM-TFM-FreeLoss', type=str,
+parser.add_argument('--work_dir', default='LM-TFM-BaseGate-NoLBL', type=str,
                     help='experiment directory.')
 parser.add_argument('--restart', action='store_true',
                     help='restart training from the saved checkpoint')
@@ -183,7 +192,7 @@ parser.add_argument('--static-loss-scale', type=float, default=1,
 parser.add_argument('--dynamic-loss-scale', action='store_true',
                     help='Use dynamic loss scaling.')
 
-# Freeze (gate only — no HyperRouter freezing needed)
+# Freeze
 parser.add_argument('--freeze_gate', action='store_true')
 parser.add_argument('--freeze_main_network', action='store_true')
 parser.add_argument('--freeze_main_network_all', action='store_true')
@@ -191,11 +200,11 @@ parser.add_argument('--freeze_main_network_all', action='store_true')
 args = parser.parse_args()
 args.tied = not args.not_tied
 
-# Fixed: always use BalancingLossFreeGate, always MoE
+# Fixed: always use CustomNaiveGate_Balance, always MoE
 args.moe = True
 args.attn_moe = False
-args.gate_name = 'BalancingLossFreeGate'
-# Not used but kept for compatibility with new_utils
+args.gate_name = 'CustomNaiveGate_Balance'
+# Kept for compatibility with new_utils
 args.dense_drop = False
 args.expert_drop = 0.5
 args.num_expert = args.moe_num_expert
@@ -213,7 +222,7 @@ args.work_dir = '{}-{}'.format(args.work_dir, args.dataset)
 args.work_dir = os.path.join(args.work_dir, time.strftime('%Y%m%d-%H%M%S'))
 logging = create_exp_dir(
     args.work_dir,
-    scripts_to_save=['train_free_loss.py', 'mem_transformer.py'],
+    scripts_to_save=['train_base_gate_no_lbl.py', 'mem_transformer.py'],
     debug=args.debug,
 )
 
@@ -350,7 +359,7 @@ else:
         clamp_len=args.clamp_len, sample_softmax=args.sample_softmax,
         moe=args.moe, moe_num_expert=args.moe_num_expert,
         moe_top_k=args.moe_top_k,
-        gate_name='BalancingLossFreeGate',  # string — eval()'d inside mem_transformer
+        gate_name='CustomNaiveGate_Balance',
         moe_index=moe_index,
         dense_drop=False, expert_drop=0.5,
         num_expert=args.moe_num_expert, attn_moe=False,
@@ -616,6 +625,9 @@ def train():
                 ret = para_model(data_i, target_i, *mems[i])
                 loss, mems[i] = ret[0], ret[1:]
                 loss = loss.float().mean().type_as(loss) / args.batch_chunk
+
+                # No auxiliary balancing loss — pure cross-entropy only
+
                 if args.fp16:
                     optimizer.backward(loss)
                 else:
@@ -625,8 +637,9 @@ def train():
             ret = para_model(data, target, *mems)
             loss, mems = ret[0], ret[1:]
             loss = loss.float().mean().type_as(loss)
-            # No auxiliary balancing loss needed — BalancingLossFreeGate
-            # handles balance via EMA memory, not via loss term.
+
+            # No auxiliary balancing loss — pure cross-entropy only
+
             if args.fp16:
                 optimizer.backward(loss)
             else:
@@ -641,10 +654,6 @@ def train():
         optimizer.step()
         if args.sample_softmax > 0:
             optimizer_sparse.step()
-
-        # Finalize EMA step for BalancingLossFreeGate
-        if hasattr(model, 'balancing_state') and model.balancing_state is not None:
-            model.balancing_state.finalize_step()
 
         # step-wise learning rate annealing
         train_step += 1

@@ -22,6 +22,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from data_utils import get_lm_corpus
@@ -516,25 +517,83 @@ def evaluate(model, eval_iter):
     return total_loss / total_len
 
 
-def _collect_cached_routing(model):
-    """Collect routing decisions from gate cache (no extra forward pass).
+def _collect_routing_metrics(model, para_model, data, target, *mems):
+    """Collect routing decisions AND per-layer balance loss in one forward pass.
 
-    Each gate caches ``last_top_k_idx`` during the normal training forward
-    pass, so we only need to read and clone those tensors.
+    Uses forward hooks on gate modules.  Runs a **separate no-grad eval
+    forward** so it never affects training gradients.
+
+    Balance loss follows the Switch Transformer formula (Fedus et al., 2021):
+        L_aux = N * Σ_i (f_i * P_i)       (α coefficient omitted)
+    where
+        N  = number of experts
+        f_i = fraction of tokens hard-routed to expert i  (via argmax)
+        P_i = mean softmax probability assigned to expert i
 
     Returns:
-        dict[int, Tensor]: Mapping from layer index to cloned gate_top_k_idx.
+        tuple: (routing_decisions, balance_losses)
+            routing_decisions : dict[int, Tensor]  layer_idx -> top-k indices (CPU)
+            balance_losses    : dict[int, float]   layer_idx -> L_aux value
     """
     base_model = model
     while hasattr(base_model, 'module'):
         base_model = base_model.module
-    decisions = {}
-    for idx, layer in enumerate(base_model.layers):
+
+    indices_dict = {}
+    balance_dict = {}
+    handles = []
+
+    def _make_hook(layer_idx):
+        def hook_fn(module, inp, output):
+            # --- Routing decisions (for fluctuation) ---
+            gate_top_k_idx = output[0]
+            indices_dict[layer_idx] = gate_top_k_idx.detach().cpu()
+
+            # --- Balance loss (for monitoring) ---
+            # Recompute raw logits via the gate's linear layer (cheap)
+            x = inp[0]                              # (T, d_model)
+            gate_logits = module.gate(x)             # (T, N)
+            N = gate_logits.shape[-1]                # num experts
+            T = gate_logits.shape[0]                 # num tokens
+
+            # P_i: mean softmax probability per expert
+            P = F.softmax(gate_logits, dim=-1).mean(dim=0)   # (N,)
+
+            # f_i: fraction of tokens actually routed to each expert
+            # Use gate_top_k_idx[:, 0] (actual top-1 routing decision)
+            # instead of recomputing argmax from raw logits, so f_i
+            # reflects the real routing including any bias-adjustment.
+            top1 = gate_top_k_idx[:, 0]                              # (T,)
+            N = gate_logits.shape[-1]
+            f = torch.zeros(N, device=gate_top_k_idx.device)
+            f.scatter_add_(0, top1, torch.ones(top1.shape[0], device=gate_top_k_idx.device))
+            f = f / top1.shape[0]
+
+            # L_aux = N * Σ(f_i * P_i)
+            balance_dict[layer_idx] = (N * (f * P).sum()).item()
+        return hook_fn
+
+    # Register hooks on all MoE gates
+    layer_idx = 0
+    for layer in base_model.layers:
         if hasattr(layer, 'pos_ff') and hasattr(layer.pos_ff, 'gate'):
-            gate = layer.pos_ff.gate
-            if hasattr(gate, 'last_top_k_idx') and gate.last_top_k_idx is not None:
-                decisions[idx] = gate.last_top_k_idx.clone()
-    return decisions
+            handle = layer.pos_ff.gate.register_forward_hook(_make_hook(layer_idx))
+            handles.append(handle)
+        layer_idx += 1
+
+    # Quick forward pass (no grad, no backward)
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        _ = para_model(data, target, *mems)
+    if was_training:
+        model.train()
+
+    # Remove hooks
+    for handle in handles:
+        handle.remove()
+
+    return indices_dict, balance_dict
 
 
 def train():
@@ -638,16 +697,18 @@ def train():
             train_loss = 0
             log_start_time = time.time()
 
-        # Log routing fluctuation every 1000 steps.
-        # Compare two CONSECUTIVE steps (N-1 vs N) rather than 1000-step apart.
-        # At step N-1: cache routing decisions from the training forward pass.
-        # At step N:   compare current routing decisions with cached step N-1.
+        # Log routing metrics every 1000 steps.
+        # Fluctuation: compare two CONSECUTIVE steps (N-1 vs N).
+        # Balance loss: Switch Transformer L_aux (monitoring only, no gradient).
         if train_step % 1000 == 999:
-            # Save routing decisions from this step (step N-1)
-            prev_routing_decisions = _collect_cached_routing(model)
+            prev_routing_decisions, _ = _collect_routing_metrics(
+                model, para_model, data, target, *mems)
         elif train_step % 1000 == 0 and train_step > 0:
             if prev_routing_decisions is not None:
-                curr_routing_decisions = _collect_cached_routing(model)
+                curr_routing_decisions, balance_losses = _collect_routing_metrics(
+                    model, para_model, data, target, *mems)
+
+                # --- Routing Fluctuation ---
                 fluctuations = compute_layer_fluctuations(
                     curr_routing_decisions, prev_routing_decisions)
                 if fluctuations:
@@ -658,6 +719,16 @@ def train():
                             '(step {} vs {}) | avg {:.4f} | {}'.format(
                         train_step, train_step - 1, train_step,
                         avg_fluc, ' | '.join(fluc_strs)))
+
+                # --- Balance Loss (monitoring only) ---
+                if balance_losses:
+                    bl_strs = ['layer_{}: {:.4f}'.format(k, v)
+                               for k, v in sorted(balance_losses.items())]
+                    avg_bl = sum(balance_losses.values()) / len(balance_losses)
+                    logging('| Balance Loss (monitor) at step {:>8d} '
+                            '| avg {:.4f} | {}'.format(
+                        train_step, avg_bl, ' | '.join(bl_strs)))
+
                 prev_routing_decisions = None  # free memory until next window
 
         if train_step % args.eval_interval == 0:
