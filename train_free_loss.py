@@ -680,13 +680,23 @@ def train():
         # Log routing metrics every 1000 steps.
         # Fluctuation: compare two CONSECUTIVE steps (N-1 vs N).
         # Balance loss: Switch Transformer L_aux (monitoring only, no gradient).
+        if train_step % 1000 == 999 or (train_step % 1000 == 0 and train_step > 0):
+            # When batch_chunk > 1, data/mems are for full batch but
+            # BalancedDataParallel expects chunk-sized batches.
+            if args.batch_chunk > 1:
+                _data = torch.chunk(data, args.batch_chunk, 1)[0]
+                _target = torch.chunk(target, args.batch_chunk, 1)[0]
+                _mems = mems[0] if isinstance(mems, list) else mems
+            else:
+                _data, _target, _mems = data, target, mems
+
         if train_step % 1000 == 999:
             prev_routing_decisions, _ = _collect_routing_metrics(
-                model, para_model, data, target, *mems)
+                model, para_model, _data, _target, *_mems)
         elif train_step % 1000 == 0 and train_step > 0:
             if prev_routing_decisions is not None:
                 curr_routing_decisions, balance_losses = _collect_routing_metrics(
-                    model, para_model, data, target, *mems)
+                    model, para_model, _data, _target, *_mems)
 
                 # --- Routing Fluctuation ---
                 fluctuations = compute_layer_fluctuations(
