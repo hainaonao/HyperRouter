@@ -635,7 +635,7 @@ def train():
                             balance_loss += m.loss
                     scaled_bal = args.load_balance * balance_loss / args.batch_chunk
                     loss += scaled_bal
-                    bal_loss_val = scaled_bal.float().item()
+                    bal_loss_val = float(scaled_bal)
 
                 if args.fp16:
                     optimizer.backward(loss)
@@ -658,7 +658,7 @@ def train():
                         balance_loss += m.loss
                 scaled_bal = args.load_balance * balance_loss
                 loss += scaled_bal
-                bal_loss_val = scaled_bal.float().item()
+                bal_loss_val = float(scaled_bal)
 
             if args.fp16:
                 optimizer.backward(loss)
