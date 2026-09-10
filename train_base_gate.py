@@ -598,7 +598,7 @@ def _collect_routing_metrics(model, para_model, data, target, *mems):
 
 def train():
     """Run one epoch of training."""
-    global train_step, train_loss, best_val_loss, best_val_loss_dense
+    global train_step, train_task_loss, train_bal_loss, best_val_loss, best_val_loss_dense
     global eval_start_time, log_start_time, all_top_k, prev_routing_decisions
     model.train()
 
@@ -624,38 +624,48 @@ def train():
                 ret = para_model(data_i, target_i, *mems[i])
                 loss, mems[i] = ret[0], ret[1:]
                 loss = loss.float().mean().type_as(loss) / args.batch_chunk
+                task_loss_val = loss.float().item()  # Track task loss separately
 
                 # Add auxiliary balancing loss (accumulated across chunks)
+                bal_loss_val = 0.0
                 if args.load_balance > 0:
                     balance_loss = 0
                     for name, m in model.named_modules():
                         if isinstance(m, CustomNaiveGate_Balance) and m.loss is not None:
                             balance_loss += m.loss
-                    loss += args.load_balance * balance_loss / args.batch_chunk
+                    scaled_bal = args.load_balance * balance_loss / args.batch_chunk
+                    loss += scaled_bal
+                    bal_loss_val = scaled_bal.float().item()
 
                 if args.fp16:
                     optimizer.backward(loss)
                 else:
                     loss.backward()
-                train_loss += loss.float().item()
+                train_task_loss += task_loss_val
+                train_bal_loss += bal_loss_val
         else:
             ret = para_model(data, target, *mems)
             loss, mems = ret[0], ret[1:]
             loss = loss.float().mean().type_as(loss)
+            task_loss_val = loss.float().item()  # Track task loss separately
 
             # Add auxiliary balancing loss
+            bal_loss_val = 0.0
             if args.load_balance > 0:
                 balance_loss = 0
                 for name, m in model.named_modules():
                     if isinstance(m, CustomNaiveGate_Balance) and m.loss is not None:
                         balance_loss += m.loss
-                loss += args.load_balance * balance_loss
+                scaled_bal = args.load_balance * balance_loss
+                loss += scaled_bal
+                bal_loss_val = scaled_bal.float().item()
 
             if args.fp16:
                 optimizer.backward(loss)
             else:
                 loss.backward()
-            train_loss += loss.float().item()
+            train_task_loss += task_loss_val
+            train_bal_loss += bal_loss_val
 
         if args.fp16:
             optimizer.clip_master_grads(args.clip)
@@ -683,18 +693,23 @@ def train():
             scheduler.step(train_step)
 
         if train_step % args.log_interval == 1:
-            cur_loss = train_loss / args.log_interval
+            cur_task_loss = train_task_loss / args.log_interval
+            cur_bal_loss = train_bal_loss / args.log_interval
+            cur_total_loss = cur_task_loss + cur_bal_loss
             elapsed = time.time() - log_start_time
             log_str = '| epoch {:3d} step {:>8d} | {:>6d} batches | lr {:.3g} ' \
-                      '| ms/batch {:5.2f} | loss {:5.2f}'.format(
+                      '| ms/batch {:5.2f} | task_loss {:5.2f} | bal_loss {:7.4f} ' \
+                      '| total {:5.2f}'.format(
                 epoch, train_step, batch + 1, optimizer.param_groups[0]['lr'],
-                elapsed * 1000 / args.log_interval, cur_loss)
+                elapsed * 1000 / args.log_interval,
+                cur_task_loss, cur_bal_loss, cur_total_loss)
             if args.dataset in ['enwik8', 'text8']:
-                log_str += ' | bpc {:9.5f}'.format(cur_loss / math.log(2))
+                log_str += ' | bpc {:9.5f}'.format(cur_task_loss / math.log(2))
             else:
-                log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
+                log_str += ' | ppl {:9.3f}'.format(math.exp(cur_task_loss))
             logging(log_str)
-            train_loss = 0
+            train_task_loss = 0
+            train_bal_loss = 0
             log_start_time = time.time()
 
         # Log routing metrics every 1000 steps.
@@ -806,7 +821,8 @@ def train():
 # Main training loop
 # ---------------------------------------------------------------------------
 train_step = 0
-train_loss = 0
+train_task_loss = 0
+train_bal_loss = 0
 best_val_loss = None
 best_val_loss_dense = None
 log_start_time = time.time()
@@ -871,4 +887,4 @@ for gate_number in [1, 2, 4, 8, 16]:
         logging('=' * 100)
 
 all_top_k = np.array(all_top_k)
-print('* Mean Top-K During Training = {}-[{}]'.format(all_top_k, all_top_k))
+print('* Mean Top-K During Training = {}-[{}]'.format(np.mean(all_top_k), all_top_k.shape[0]))

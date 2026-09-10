@@ -148,18 +148,21 @@ class CustomNaiveGate_Balance(BaseGate):
         self.loss = None
 
     def set_load_balance(self, gate, gate_top_k_idx):
-        # gate_top_k_idx (tokens_number, top-k)
-        # gate_top_k_val (tokens_number, top-k)
+        # gate: (T, N) raw logits
+        # gate_top_k_idx: (T, top_k) selected expert indices
 
         score = F.softmax(gate, dim=-1)
-        valid_idx = gate_top_k_idx[gate_top_k_idx > -1]
-        fraction_expert = torch.scatter_add(
-                torch.zeros(self.tot_expert, device=valid_idx.device),
-                0,
-                valid_idx,
-                torch.ones_like(valid_idx, dtype=torch.float),
-            ) / valid_idx.numel()
-        prob_expert = score.sum(dim=0) / valid_idx.numel()
+        T = gate_top_k_idx.shape[0]  # number of tokens
+
+        # f_i: fraction of tokens routed to expert i (top-1 routing decision)
+        top1 = gate_top_k_idx[:, 0]
+        fraction_expert = torch.zeros(self.tot_expert, device=top1.device)
+        fraction_expert.scatter_add_(
+            0, top1, torch.ones(T, device=top1.device, dtype=torch.float))
+        fraction_expert = fraction_expert / T
+
+        # P_i: mean softmax probability per expert
+        prob_expert = score.mean(dim=0)
 
         loss = (fraction_expert * prob_expert).sum() * self.tot_expert
         self.loss = loss

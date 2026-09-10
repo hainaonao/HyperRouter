@@ -860,4 +860,4 @@ for gate_number in [1, 2, 4, 8, 16]:
         logging('=' * 100)
 
 all_top_k = np.array(all_top_k)
-print('* Mean Top-K During Training = {}-[{}]'.format(all_top_k, all_top_k))
+print('* Mean Top-K During Training = {}-[{}]'.format(np.mean(all_top_k), all_top_k.shape[0]))
